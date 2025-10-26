@@ -185,21 +185,33 @@ async def detect_video(
     gps_lon: Optional[float] = None
 ):
     """Process uploaded video and return annotated video"""
+    input_path = None
+    output_path = None
+    
     try:
+        # Create temporary directory
+        temp_dir = tempfile.mkdtemp()
+        
         # Save uploaded video to temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_input:
-            contents = await file.read()
-            tmp_input.write(contents)
-            input_path = tmp_input.name
+        input_path = os.path.join(temp_dir, 'input_video.mp4')
+        contents = await file.read()
+        with open(input_path, 'wb') as f:
+            f.write(contents)
         
         # Open video
         cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise HTTPException(status_code=400, detail="Failed to open video file")
+        
         fps = int(cap.get(cv2.CAP_PROP_FPS))
+        if fps == 0:
+            fps = 30  # Default to 30 fps if unable to detect
+            
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
         # Create output video
-        output_path = tempfile.mktemp(suffix='.mp4')
+        output_path = os.path.join(temp_dir, 'output_video.mp4')
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         
@@ -228,15 +240,16 @@ async def detect_video(
         cap.release()
         out.release()
         
-        # Clean up input file
-        os.unlink(input_path)
+        # Check if output file was created
+        if not os.path.exists(output_path):
+            raise HTTPException(status_code=500, detail="Failed to create output video")
         
         # Read output video
         with open(output_path, 'rb') as f:
             video_data = f.read()
         
-        # Clean up output file
-        os.unlink(output_path)
+        # Clean up temp directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
         
         # Return video as streaming response
         return StreamingResponse(
