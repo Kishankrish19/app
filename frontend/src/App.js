@@ -5,14 +5,16 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Camera, Upload, Video, AlertTriangle, MapPin, TrendingDown, Bell } from "lucide-react";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Camera, Upload, Video, AlertTriangle, MapPin, TrendingDown, Bell, Smartphone, Wifi } from "lucide-react";
 import { toast } from "sonner";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
-const CRITICAL_DISTANCE = 2.0; // meters - trigger alert
-const WARNING_DISTANCE = 5.0; // meters - monitor for approaching
+const CRITICAL_DISTANCE = 2.0;
+const WARNING_DISTANCE = 5.0;
 
 function App() {
   const [mode, setMode] = useState("camera");
@@ -23,7 +25,11 @@ function App() {
   const [alerts, setAlerts] = useState([]);
   const [availableCameras, setAvailableCameras] = useState([]);
   const [selectedCamera, setSelectedCamera] = useState("");
-  const [objectHistory, setObjectHistory] = useState({}); // Track object positions over time
+  const [cameraSource, setCameraSource] = useState("local"); // 'local' or 'mobile'
+  const [mobileStreamUrl, setMobileStreamUrl] = useState("");
+  const [mobileConnected, setMobileConnected] = useState(false);
+  const [objectHistory, setObjectHistory] = useState({});
+  const [sessionId] = useState(() => Math.random().toString(36).substring(7));
   
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -32,6 +38,7 @@ function App() {
   const speechSynthesisRef = useRef(window.speechSynthesis);
   const lastAlertTimeRef = useRef({});
   const frameCountRef = useRef(0);
+  const mobileStreamRef = useRef(null);
 
   // Request GPS location
   useEffect(() => {
@@ -44,18 +51,11 @@ function App() {
           });
         },
         (error) => {
-          console.log("GPS not available, using simulated location");
-          setGpsLocation({
-            latitude: 12.9716,
-            longitude: 77.5946
-          });
+          setGpsLocation({ latitude: 12.9716, longitude: 77.5946 });
         }
       );
     } else {
-      setGpsLocation({
-        latitude: 12.9716,
-        longitude: 77.5946
-      });
+      setGpsLocation({ latitude: 12.9716, longitude: 77.5946 });
     }
   }, []);
 
@@ -71,7 +71,6 @@ function App() {
         }
       } catch (error) {
         console.error("Error enumerating cameras:", error);
-        toast.error("Failed to detect cameras");
       }
     };
     getCameras();
@@ -92,7 +91,113 @@ function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Start camera with selected device
+  // Connect to mobile camera
+  const connectMobileCamera = async () => {
+    if (!mobileStreamUrl.trim()) {
+      toast.error("Please enter a valid stream URL");
+      return;
+    }
+
+    try {
+      setProcessing(true);
+      const response = await axios.post(`${API}/camera/mobile/connect`, {
+        stream_url: mobileStreamUrl,
+        session_id: sessionId
+      });
+
+      setMobileConnected(true);
+      toast.success(response.data.message);
+      
+      // Auto-start camera after successful connection
+      setTimeout(() => {
+        startMobileCamera();
+      }, 500);
+    } catch (error) {
+      console.error("Mobile connection error:", error);
+      toast.error(error.response?.data?.detail || "Failed to connect to mobile camera");
+      setMobileConnected(false);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  // Start mobile camera stream
+  const startMobileCamera = () => {
+    setCameraActive(true);
+    frameCountRef.current = 0;
+    setObjectHistory({});
+    startMobileDetectionLoop();
+  };
+
+  // Mobile detection loop
+  const startMobileDetectionLoop = () => {
+    detectionIntervalRef.current = setInterval(async () => {
+      await captureMobileFrame();
+    }, 500);
+  };
+
+  // Capture frame from mobile stream
+  const captureMobileFrame = async () => {
+    try {
+      frameCountRef.current++;
+      
+      const response = await axios.post(
+        `${API}/detect/stream`,
+        null,
+        {
+          params: {
+            stream_url: mobileStreamUrl,
+            gps_lat: gpsLocation?.latitude,
+            gps_lon: gpsLocation?.longitude
+          }
+        }
+      );
+
+      // Analyze detections for approaching objects
+      const enrichedDetections = response.data.detections.map(detection => {
+        const movement = analyzeObjectMovement(
+          detection.class,
+          detection.distance || 10,
+          detection.bbox
+        );
+        return {
+          ...detection,
+          isApproaching: movement.isApproaching,
+          velocity: movement.velocity
+        };
+      });
+
+      setResult({
+        ...response.data,
+        detections: enrichedDetections
+      });
+
+      // Handle alerts
+      handleAlerts(enrichedDetections);
+    } catch (error) {
+      console.error("Mobile frame capture error:", error);
+      // Auto-fallback to local camera
+      if (cameraActive && mobileConnected) {
+        toast.error("Lost mobile connection. Attempting fallback to local camera...");
+        await fallbackToLocalCamera();
+      }
+    }
+  };
+
+  // Fallback to local camera
+  const fallbackToLocalCamera = async () => {
+    stopCamera();
+    setMobileConnected(false);
+    setCameraSource("local");
+    toast.info("Switched to local camera");
+    
+    // Auto-start local camera
+    setTimeout(() => {
+      startCamera();
+    }, 1000);
+  };
+
+  // Start local camera
   const startCamera = async () => {
     try {
       const constraints = {
@@ -112,9 +217,7 @@ function App() {
         setCameraActive(true);
         frameCountRef.current = 0;
         setObjectHistory({});
-        toast.success("Camera started");
-        
-        // Start detection loop
+        toast.success("Local camera started");
         startDetectionLoop();
       }
     } catch (error) {
@@ -128,27 +231,35 @@ function App() {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
-      setCameraActive(false);
-      
-      if (detectionIntervalRef.current) {
-        clearInterval(detectionIntervalRef.current);
-        detectionIntervalRef.current = null;
-      }
-      
-      setObjectHistory({});
-      frameCountRef.current = 0;
-      toast.info("Camera stopped");
     }
+    
+    if (detectionIntervalRef.current) {
+      clearInterval(detectionIntervalRef.current);
+      detectionIntervalRef.current = null;
+    }
+    
+    setCameraActive(false);
+    setObjectHistory({});
+    frameCountRef.current = 0;
+    
+    if (mobileConnected) {
+      axios.post(`${API}/camera/mobile/disconnect`, null, {
+        params: { session_id: sessionId }
+      }).catch(console.error);
+      setMobileConnected(false);
+    }
+    
+    toast.info("Camera stopped");
   };
 
-  // Detection loop for live camera
+  // Local camera detection loop
   const startDetectionLoop = () => {
     detectionIntervalRef.current = setInterval(async () => {
       await captureAndDetect();
-    }, 500); // Process every 0.5 seconds for better tracking
+    }, 500);
   };
 
-  // Calculate if object is approaching
+  // Analyze object movement
   const analyzeObjectMovement = (objectClass, currentDistance, bbox) => {
     const objectKey = objectClass;
     const now = Date.now();
@@ -166,28 +277,48 @@ function App() {
     history.distances.push(currentDistance);
     history.timestamps.push(now);
     
-    // Keep only last 5 frames
     if (history.distances.length > 5) {
       history.distances.shift();
       history.timestamps.shift();
     }
     
-    // Calculate velocity (approaching if negative)
     if (history.distances.length >= 3) {
       const oldDistance = history.distances[0];
-      const timeDiff = (now - history.timestamps[0]) / 1000; // seconds
-      const velocity = (currentDistance - oldDistance) / timeDiff; // m/s
-      
-      // Approaching if getting closer (negative velocity) and significant change
+      const timeDiff = (now - history.timestamps[0]) / 1000;
+      const velocity = (currentDistance - oldDistance) / timeDiff;
       const isApproaching = velocity < -0.3 && currentDistance < WARNING_DISTANCE;
-      
       return { isApproaching, velocity: Math.abs(velocity) };
     }
     
     return { isApproaching: false, velocity: 0 };
   };
 
-  // Capture frame and send for detection
+  // Handle alerts
+  const handleAlerts = (detections) => {
+    const now = Date.now();
+    detections.forEach(detection => {
+      const objectKey = detection.class;
+      
+      if (detection.distance && detection.distance < CRITICAL_DISTANCE) {
+        if (!lastAlertTimeRef.current[objectKey] || 
+            now - lastAlertTimeRef.current[objectKey] > 3000) {
+          lastAlertTimeRef.current[objectKey] = now;
+          speakAlert(`Danger! ${detection.class} very close at ${detection.distance} meters`, true);
+          toast.error(`⚠️ CRITICAL: ${detection.class} at ${detection.distance}m`, { duration: 3000 });
+        }
+      }
+      else if (detection.isApproaching && detection.distance < WARNING_DISTANCE) {
+        if (!lastAlertTimeRef.current[`${objectKey}_approach`] || 
+            now - lastAlertTimeRef.current[`${objectKey}_approach`] > 5000) {
+          lastAlertTimeRef.current[`${objectKey}_approach`] = now;
+          speakAlert(`Notice: ${detection.class} approaching at ${detection.distance} meters`, false);
+          toast.warning(`⚡ ${detection.class} approaching - ${detection.distance}m`, { duration: 2000 });
+        }
+      }
+    });
+  };
+
+  // Capture and detect from local camera
   const captureAndDetect = async () => {
     if (!videoRef.current || !canvasRef.current) return;
     
@@ -202,7 +333,6 @@ function App() {
     
     frameCountRef.current++;
     
-    // Convert canvas to blob
     canvas.toBlob(async (blob) => {
       if (!blob) return;
       
@@ -219,14 +349,12 @@ function App() {
           headers: { 'Content-Type': 'multipart/form-data' }
         });
         
-        // Analyze detections for approaching objects
         const enrichedDetections = response.data.detections.map(detection => {
           const movement = analyzeObjectMovement(
             detection.class,
             detection.distance || 10,
             detection.bbox
           );
-          
           return {
             ...detection,
             isApproaching: movement.isApproaching,
@@ -239,48 +367,19 @@ function App() {
           detections: enrichedDetections
         });
         
-        // Handle alerts
-        const now = Date.now();
-        enrichedDetections.forEach(detection => {
-          const objectKey = detection.class;
-          
-          // Critical alert for very close objects (<2m)
-          if (detection.distance && detection.distance < CRITICAL_DISTANCE) {
-            if (!lastAlertTimeRef.current[objectKey] || 
-                now - lastAlertTimeRef.current[objectKey] > 3000) {
-              lastAlertTimeRef.current[objectKey] = now;
-              speakAlert(`Danger! ${detection.class} very close at ${detection.distance} meters`, true);
-              toast.error(`⚠️ CRITICAL: ${detection.class} at ${detection.distance}m`, {
-                duration: 3000
-              });
-            }
-          }
-          // Warning for approaching objects
-          else if (detection.isApproaching && detection.distance < WARNING_DISTANCE) {
-            if (!lastAlertTimeRef.current[`${objectKey}_approach`] || 
-                now - lastAlertTimeRef.current[`${objectKey}_approach`] > 5000) {
-              lastAlertTimeRef.current[`${objectKey}_approach`] = now;
-              speakAlert(`Notice: ${detection.class} approaching at ${detection.distance} meters`, false);
-              toast.warning(`⚡ ${detection.class} approaching - ${detection.distance}m`, {
-                duration: 2000
-              });
-            }
-          }
-        });
+        handleAlerts(enrichedDetections);
       } catch (error) {
         console.error("Error detecting frame:", error);
       }
     }, 'image/jpeg', 0.8);
   };
 
-  // Voice alert with urgency
+  // Voice alert
   const speakAlert = (text, urgent = false) => {
     if (speechSynthesisRef.current) {
-      // Cancel previous alerts if urgent
       if (urgent) {
         speechSynthesisRef.current.cancel();
       }
-      
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.rate = urgent ? 1.3 : 1.0;
       utterance.pitch = urgent ? 1.2 : 1.0;
@@ -360,7 +459,7 @@ function App() {
     }
   };
 
-  // Get status color based on distance
+  // Get status color
   const getStatusColor = (detection) => {
     if (detection.distance && detection.distance < CRITICAL_DISTANCE) {
       return 'critical';
@@ -379,6 +478,12 @@ function App() {
           <div className="header-title">
             <Camera className="header-icon" />
             <h1 data-testid="app-title">YOLO Drive Assist</h1>
+            {mobileConnected && (
+              <div className="mobile-badge">
+                <Smartphone size={16} />
+                <span>Mobile Connected</span>
+              </div>
+            )}
           </div>
           {gpsLocation && (
             <div className="gps-display" data-testid="gps-location">
@@ -420,52 +525,143 @@ function App() {
                 </TabsList>
 
                 <TabsContent value="camera" className="mode-content">
-                  {availableCameras.length > 1 && (
-                    <div className="camera-selector" data-testid="camera-selector">
-                      <label>Select Camera:</label>
-                      <Select value={selectedCamera} onValueChange={setSelectedCamera} disabled={cameraActive}>
-                        <SelectTrigger className="camera-select-trigger">
-                          <SelectValue placeholder="Choose camera" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {availableCameras.map((camera, idx) => (
-                            <SelectItem key={camera.deviceId} value={camera.deviceId}>
-                              {camera.label || `Camera ${idx + 1}`}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
+                  {/* Camera Source Selector */}
+                  <div className="source-selector" data-testid="source-selector">
+                    <Label>Camera Source:</Label>
+                    <Select value={cameraSource} onValueChange={setCameraSource} disabled={cameraActive}>
+                      <SelectTrigger className="source-select-trigger">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="local">Local PC/Laptop Camera</SelectItem>
+                        <SelectItem value="mobile">📱 Mobile Camera (IP Stream)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  {cameraSource === "local" && (
+                    <>
+                      {availableCameras.length > 1 && (
+                        <div className="camera-selector" data-testid="camera-selector">
+                          <Label>Select Camera:</Label>
+                          <Select value={selectedCamera} onValueChange={setSelectedCamera} disabled={cameraActive}>
+                            <SelectTrigger className="camera-select-trigger">
+                              <SelectValue placeholder="Choose camera" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {availableCameras.map((camera, idx) => (
+                                <SelectItem key={camera.deviceId} value={camera.deviceId}>
+                                  {camera.label || `Camera ${idx + 1}`}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      )}
+                      
+                      <div className="camera-info" data-testid="camera-info">
+                        <p className="info-text">📹 {availableCameras.length} camera(s) detected</p>
+                      </div>
+                      
+                      <div className="camera-controls">
+                        {!cameraActive ? (
+                          <Button onClick={startCamera} className="start-camera-btn" data-testid="start-camera-btn">
+                            <Camera size={18} />
+                            Start Camera
+                          </Button>
+                        ) : (
+                          <Button onClick={stopCamera} variant="destructive" data-testid="stop-camera-btn">
+                            Stop Camera
+                          </Button>
+                        )}
+                      </div>
+                    </>
+                  )}
+
+                  {cameraSource === "mobile" && (
+                    <>
+                      <div className="mobile-stream-config">
+                        <Label htmlFor="stream-url">Mobile Camera Stream URL</Label>
+                        <Input
+                          id="stream-url"
+                          type="text"
+                          placeholder="http://192.168.1.100:8080/video"
+                          value={mobileStreamUrl}
+                          onChange={(e) => setMobileStreamUrl(e.target.value)}
+                          disabled={cameraActive}
+                          className="stream-url-input"
+                          data-testid="mobile-stream-url"
+                        />
+                        <div className="mobile-help">
+                          <p>📱 <strong>Setup Instructions:</strong></p>
+                          <ol>
+                            <li>Install "IP Webcam" or "DroidCam" on your phone</li>
+                            <li>Start the camera server in the app</li>
+                            <li>Copy the stream URL shown (e.g., http://192.168.1.100:8080/video)</li>
+                            <li>Paste it above and click Connect</li>
+                          </ol>
+                          <p className="mobile-note">⚠️ Ensure your phone and PC are on the same network</p>
+                        </div>
+                      </div>
+                      
+                      <div className="camera-controls">
+                        {!mobileConnected ? (
+                          <Button 
+                            onClick={connectMobileCamera} 
+                            className="connect-mobile-btn" 
+                            disabled={processing}
+                            data-testid="connect-mobile-btn"
+                          >
+                            <Wifi size={18} />
+                            {processing ? "Connecting..." : "Connect Mobile Camera"}
+                          </Button>
+                        ) : !cameraActive ? (
+                          <Button onClick={startMobileCamera} className="start-camera-btn">
+                            <Camera size={18} />
+                            Start Detection
+                          </Button>
+                        ) : (
+                          <Button onClick={stopCamera} variant="destructive">
+                            Stop Camera
+                          </Button>
+                        )}
+                      </div>
+                    </>
                   )}
                   
-                  <div className="camera-info" data-testid="camera-info">
-                    <p className="info-text">📹 {availableCameras.length} camera(s) detected</p>
-                  </div>
-                  
-                  <div className="camera-controls">
-                    {!cameraActive ? (
-                      <Button onClick={startCamera} className="start-camera-btn" data-testid="start-camera-btn">
-                        <Camera size={18} />
-                        Start Camera
-                      </Button>
-                    ) : (
-                      <Button onClick={stopCamera} variant="destructive" data-testid="stop-camera-btn">
-                        Stop Camera
-                      </Button>
-                    )}
-                  </div>
-                  
                   <div className="video-container">
-                    <video
-                      ref={videoRef}
-                      autoPlay
-                      playsInline
-                      className="camera-feed"
-                      data-testid="camera-video"
-                    />
-                    {cameraActive && (
-                      <div className="camera-overlay">
-                        <div className="fps-counter">Frame: {frameCountRef.current}</div>
+                    {cameraSource === "local" ? (
+                      <>
+                        <video
+                          ref={videoRef}
+                          autoPlay
+                          playsInline
+                          className="camera-feed"
+                          data-testid="camera-video"
+                        />
+                        {cameraActive && (
+                          <div className="camera-overlay">
+                            <div className="fps-counter">Frame: {frameCountRef.current}</div>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div className="mobile-stream-display">
+                        {result && result.image ? (
+                          <>
+                            <img src={result.image} alt="Mobile Stream" className="mobile-stream-img" />
+                            {cameraActive && (
+                              <div className="camera-overlay">
+                                <div className="fps-counter mobile-fps">📱 Mobile | Frame: {frameCountRef.current}</div>
+                              </div>
+                            )}
+                          </>
+                        ) : (
+                          <div className="stream-placeholder">
+                            <Smartphone size={64} />
+                            <p>{mobileConnected ? "Waiting for frames..." : "Connect mobile camera to start"}</p>
+                          </div>
+                        )}
                       </div>
                     )}
                     <canvas ref={canvasRef} style={{ display: 'none' }} />
@@ -518,7 +714,7 @@ function App() {
             </Card>
           )}
 
-          {result && result.image && (
+          {result && result.image && mode === "image" && (
             <Card className="result-card">
               <CardHeader>
                 <CardTitle>Detection Result</CardTitle>
