@@ -36,9 +36,21 @@ app = FastAPI()
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
-# Distance estimation parameters (approximate)
-KNOWN_WIDTH = 1.8  # Average car width in meters
-FOCAL_LENGTH = 600  # Approximate focal length (can be calibrated)
+# Distance estimation parameters (improved calibration)
+KNOWN_WIDTHS = {
+    'car': 1.8,
+    'truck': 2.5,
+    'bus': 2.5,
+    'motorcycle': 0.8,
+    'bicycle': 0.6,
+    'person': 0.5,
+    'default': 1.5
+}
+FOCAL_LENGTH = 700  # Calibrated focal length
+
+# Alert thresholds
+CRITICAL_DISTANCE = 2.0  # meters
+WARNING_DISTANCE = 5.0   # meters
 
 # Class colors for consistent visualization
 CLASS_COLORS = {}
@@ -50,15 +62,16 @@ def get_class_color(class_id):
         CLASS_COLORS[class_id] = tuple(np.random.randint(50, 255, 3).tolist())
     return CLASS_COLORS[class_id]
 
-def estimate_distance(bbox_width, known_width=KNOWN_WIDTH, focal_length=FOCAL_LENGTH):
-    """Estimate distance to object using focal length approximation"""
+def estimate_distance(bbox_width, object_class, focal_length=FOCAL_LENGTH):
+    """Estimate distance to object using focal length approximation with class-specific widths"""
     if bbox_width > 0:
+        known_width = KNOWN_WIDTHS.get(object_class, KNOWN_WIDTHS['default'])
         distance = (known_width * focal_length) / bbox_width
         return round(distance, 1)
     return None
 
 def draw_detections(image, results):
-    """Draw bounding boxes and labels on image"""
+    """Draw bounding boxes and labels on image with enhanced visualization"""
     annotated_image = image.copy()
     detections = []
     
@@ -73,23 +86,41 @@ def draw_detections(image, results):
             
             # Calculate distance
             bbox_width = x2 - x1
-            distance = estimate_distance(bbox_width)
+            distance = estimate_distance(bbox_width, class_name)
             
-            # Get color for this class
-            color = get_class_color(class_id)
+            # Determine alert level
+            alert_level = 'safe'
+            if distance:
+                if distance < CRITICAL_DISTANCE:
+                    alert_level = 'critical'
+                elif distance < WARNING_DISTANCE:
+                    alert_level = 'warning'
+            
+            # Get color based on alert level
+            if alert_level == 'critical':
+                color = (0, 0, 255)  # Red
+                thickness = 3
+            elif alert_level == 'warning':
+                color = (0, 165, 255)  # Orange
+                thickness = 2
+            else:
+                color = get_class_color(class_id)
+                thickness = 2
             
             # Draw bounding box
-            cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, thickness)
             
-            # Create label with distance
+            # Create label with distance and alert
             label = f"{class_name} {confidence:.2f}"
             if distance:
                 label += f" | {distance}m"
+                if alert_level == 'critical':
+                    label += " [!]"
             
             # Draw label background
-            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(annotated_image, (x1, y1 - label_h - 10), (x1 + label_w, y1), color, -1)
-            cv2.putText(annotated_image, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(annotated_image, (x1, y1 - label_h - 15), (x1 + label_w + 10, y1), color, -1)
+            cv2.putText(annotated_image, label, (x1 + 5, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
             # Store detection data
             detections.append({
@@ -97,7 +128,8 @@ def draw_detections(image, results):
                 "confidence": round(confidence, 2),
                 "distance": distance,
                 "bbox": [x1, y1, x2, y2],
-                "alert": distance and distance < 5.0
+                "alert": distance and distance < CRITICAL_DISTANCE,
+                "alert_level": alert_level
             })
     
     return annotated_image, detections
@@ -126,7 +158,7 @@ class AlertLog(BaseModel):
 
 @api_router.get("/")
 async def root():
-    return {"message": "YOLOv8 Driver Assistance API"}
+    return {"message": "YOLOv8 Driver Assistance API", "version": "2.0"}
 
 @api_router.post("/detect/image")
 async def detect_image(
@@ -144,8 +176,8 @@ async def detect_image(
         if image is None:
             raise HTTPException(status_code=400, detail="Invalid image file")
         
-        # Run detection
-        results = model(image, conf=0.3)
+        # Run detection with optimized settings
+        results = model(image, conf=0.25, iou=0.45)
         
         # Draw detections
         annotated_image, detections = draw_detections(image, results)
@@ -225,7 +257,7 @@ async def detect_video(
                 break
             
             # Run detection every frame
-            results = model(frame, conf=0.3)
+            results = model(frame, conf=0.25, iou=0.45)
             annotated_frame, detections = draw_detections(frame, results)
             
             # Write frame
@@ -278,25 +310,25 @@ async def detect_frame(
         if image is None:
             raise HTTPException(status_code=400, detail="Invalid image data")
         
-        # Run detection
-        results = model(image, conf=0.3)
+        # Run detection with optimized settings
+        results = model(image, conf=0.25, iou=0.45)
         
         # Draw detections
         annotated_image, detections = draw_detections(image, results)
         
-        # Check for alerts
-        alert_triggered = any(d['alert'] for d in detections)
-        alerts = [d for d in detections if d['alert']]
+        # Check for critical alerts
+        critical_alerts = [d for d in detections if d['alert']]
+        alert_triggered = len(critical_alerts) > 0
         
-        # Log alert if triggered
-        if alert_triggered and alerts:
-            for alert_detection in alerts:
+        # Log critical alerts only
+        if alert_triggered:
+            for alert_detection in critical_alerts:
                 alert_entry = AlertLog(
                     object_class=alert_detection['class'],
                     distance=alert_detection['distance'],
                     gps_latitude=gps_lat,
                     gps_longitude=gps_lon,
-                    message=f"Warning! {alert_detection['class']} at {alert_detection['distance']}m"
+                    message=f"CRITICAL: {alert_detection['class']} at {alert_detection['distance']}m"
                 )
                 doc = alert_entry.model_dump()
                 doc['timestamp'] = doc['timestamp'].isoformat()
@@ -310,7 +342,7 @@ async def detect_frame(
             "image": f"data:image/jpeg;base64,{img_base64}",
             "detections": detections,
             "alert_triggered": alert_triggered,
-            "alerts": alerts
+            "alerts": critical_alerts
         }
     
     except Exception as e:

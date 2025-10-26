@@ -4,11 +4,15 @@ import axios from "axios";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Camera, Upload, Video, AlertTriangle, MapPin } from "lucide-react";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Camera, Upload, Video, AlertTriangle, MapPin, TrendingDown, Bell } from "lucide-react";
 import { toast } from "sonner";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
+
+const CRITICAL_DISTANCE = 2.0; // meters - trigger alert
+const WARNING_DISTANCE = 5.0; // meters - monitor for approaching
 
 function App() {
   const [mode, setMode] = useState("camera");
@@ -17,14 +21,17 @@ function App() {
   const [gpsLocation, setGpsLocation] = useState(null);
   const [cameraActive, setCameraActive] = useState(false);
   const [alerts, setAlerts] = useState([]);
-  const [recentLogs, setRecentLogs] = useState([]);
+  const [availableCameras, setAvailableCameras] = useState([]);
+  const [selectedCamera, setSelectedCamera] = useState("");
+  const [objectHistory, setObjectHistory] = useState({}); // Track object positions over time
   
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
   const detectionIntervalRef = useRef(null);
   const speechSynthesisRef = useRef(window.speechSynthesis);
-  const lastAlertTimeRef = useRef(0);
+  const lastAlertTimeRef = useRef({});
+  const frameCountRef = useRef(0);
 
   // Request GPS location
   useEffect(() => {
@@ -38,7 +45,6 @@ function App() {
         },
         (error) => {
           console.log("GPS not available, using simulated location");
-          // Simulated GPS for demo
           setGpsLocation({
             latitude: 12.9716,
             longitude: 77.5946
@@ -46,12 +52,29 @@ function App() {
         }
       );
     } else {
-      // Fallback to simulated GPS
       setGpsLocation({
         latitude: 12.9716,
         longitude: 77.5946
       });
     }
+  }, []);
+
+  // Enumerate available cameras
+  useEffect(() => {
+    const getCameras = async () => {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter(device => device.kind === 'videoinput');
+        setAvailableCameras(videoDevices);
+        if (videoDevices.length > 0) {
+          setSelectedCamera(videoDevices[0].deviceId);
+        }
+      } catch (error) {
+        console.error("Error enumerating cameras:", error);
+        toast.error("Failed to detect cameras");
+      }
+    };
+    getCameras();
   }, []);
 
   // Fetch recent alerts
@@ -65,21 +88,30 @@ function App() {
       }
     };
     fetchAlerts();
-    const interval = setInterval(fetchAlerts, 10000); // Update every 10s
+    const interval = setInterval(fetchAlerts, 10000);
     return () => clearInterval(interval);
   }, []);
 
-  // Start camera
+  // Start camera with selected device
   const startCamera = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment", width: 1280, height: 720 }
-      });
+      const constraints = {
+        video: {
+          deviceId: selectedCamera ? { exact: selectedCamera } : undefined,
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 }
+        }
+      };
+      
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         streamRef.current = stream;
         setCameraActive(true);
+        frameCountRef.current = 0;
+        setObjectHistory({});
         toast.success("Camera started");
         
         // Start detection loop
@@ -98,12 +130,13 @@ function App() {
       streamRef.current = null;
       setCameraActive(false);
       
-      // Stop detection loop
       if (detectionIntervalRef.current) {
         clearInterval(detectionIntervalRef.current);
         detectionIntervalRef.current = null;
       }
       
+      setObjectHistory({});
+      frameCountRef.current = 0;
       toast.info("Camera stopped");
     }
   };
@@ -112,7 +145,46 @@ function App() {
   const startDetectionLoop = () => {
     detectionIntervalRef.current = setInterval(async () => {
       await captureAndDetect();
-    }, 1000); // Process every 1 second
+    }, 500); // Process every 0.5 seconds for better tracking
+  };
+
+  // Calculate if object is approaching
+  const analyzeObjectMovement = (objectClass, currentDistance, bbox) => {
+    const objectKey = objectClass;
+    const now = Date.now();
+    
+    if (!objectHistory[objectKey]) {
+      objectHistory[objectKey] = {
+        distances: [currentDistance],
+        timestamps: [now],
+        lastAlertTime: 0
+      };
+      return { isApproaching: false, velocity: 0 };
+    }
+    
+    const history = objectHistory[objectKey];
+    history.distances.push(currentDistance);
+    history.timestamps.push(now);
+    
+    // Keep only last 5 frames
+    if (history.distances.length > 5) {
+      history.distances.shift();
+      history.timestamps.shift();
+    }
+    
+    // Calculate velocity (approaching if negative)
+    if (history.distances.length >= 3) {
+      const oldDistance = history.distances[0];
+      const timeDiff = (now - history.timestamps[0]) / 1000; // seconds
+      const velocity = (currentDistance - oldDistance) / timeDiff; // m/s
+      
+      // Approaching if getting closer (negative velocity) and significant change
+      const isApproaching = velocity < -0.3 && currentDistance < WARNING_DISTANCE;
+      
+      return { isApproaching, velocity: Math.abs(velocity) };
+    }
+    
+    return { isApproaching: false, velocity: 0 };
   };
 
   // Capture frame and send for detection
@@ -127,6 +199,8 @@ function App() {
     
     const ctx = canvas.getContext('2d');
     ctx.drawImage(video, 0, 0);
+    
+    frameCountRef.current++;
     
     // Convert canvas to blob
     canvas.toBlob(async (blob) => {
@@ -145,30 +219,71 @@ function App() {
           headers: { 'Content-Type': 'multipart/form-data' }
         });
         
-        setResult(response.data);
+        // Analyze detections for approaching objects
+        const enrichedDetections = response.data.detections.map(detection => {
+          const movement = analyzeObjectMovement(
+            detection.class,
+            detection.distance || 10,
+            detection.bbox
+          );
+          
+          return {
+            ...detection,
+            isApproaching: movement.isApproaching,
+            velocity: movement.velocity
+          };
+        });
         
-        // Handle alerts with voice
-        if (response.data.alert_triggered && response.data.alerts.length > 0) {
-          const now = Date.now();
-          // Throttle voice alerts to once every 3 seconds
-          if (now - lastAlertTimeRef.current > 3000) {
-            lastAlertTimeRef.current = now;
-            const alert = response.data.alerts[0];
-            speakAlert(`Warning! ${alert.class} ahead at ${alert.distance} meters`);
+        setResult({
+          ...response.data,
+          detections: enrichedDetections
+        });
+        
+        // Handle alerts
+        const now = Date.now();
+        enrichedDetections.forEach(detection => {
+          const objectKey = detection.class;
+          
+          // Critical alert for very close objects (<2m)
+          if (detection.distance && detection.distance < CRITICAL_DISTANCE) {
+            if (!lastAlertTimeRef.current[objectKey] || 
+                now - lastAlertTimeRef.current[objectKey] > 3000) {
+              lastAlertTimeRef.current[objectKey] = now;
+              speakAlert(`Danger! ${detection.class} very close at ${detection.distance} meters`, true);
+              toast.error(`⚠️ CRITICAL: ${detection.class} at ${detection.distance}m`, {
+                duration: 3000
+              });
+            }
           }
-        }
+          // Warning for approaching objects
+          else if (detection.isApproaching && detection.distance < WARNING_DISTANCE) {
+            if (!lastAlertTimeRef.current[`${objectKey}_approach`] || 
+                now - lastAlertTimeRef.current[`${objectKey}_approach`] > 5000) {
+              lastAlertTimeRef.current[`${objectKey}_approach`] = now;
+              speakAlert(`Notice: ${detection.class} approaching at ${detection.distance} meters`, false);
+              toast.warning(`⚡ ${detection.class} approaching - ${detection.distance}m`, {
+                duration: 2000
+              });
+            }
+          }
+        });
       } catch (error) {
         console.error("Error detecting frame:", error);
       }
     }, 'image/jpeg', 0.8);
   };
 
-  // Voice alert using Web Speech API
-  const speakAlert = (text) => {
+  // Voice alert with urgency
+  const speakAlert = (text, urgent = false) => {
     if (speechSynthesisRef.current) {
+      // Cancel previous alerts if urgent
+      if (urgent) {
+        speechSynthesisRef.current.cancel();
+      }
+      
       const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 1.2;
-      utterance.pitch = 1.0;
+      utterance.rate = urgent ? 1.3 : 1.0;
+      utterance.pitch = urgent ? 1.2 : 1.0;
       utterance.volume = 1.0;
       speechSynthesisRef.current.speak(utterance);
     }
@@ -197,7 +312,7 @@ function App() {
       toast.success("Image processed successfully");
       
       if (response.data.alert_triggered) {
-        toast.error("⚠ Collision Risk Detected!");
+        toast.error("⚠ Objects detected within critical distance!");
       }
     } catch (error) {
       console.error("Error processing image:", error);
@@ -227,7 +342,6 @@ function App() {
         responseType: 'blob'
       });
       
-      // Create download link for processed video
       const url = window.URL.createObjectURL(new Blob([response.data]));
       const link = document.createElement('a');
       link.href = url;
@@ -244,6 +358,18 @@ function App() {
     } finally {
       setProcessing(false);
     }
+  };
+
+  // Get status color based on distance
+  const getStatusColor = (detection) => {
+    if (detection.distance && detection.distance < CRITICAL_DISTANCE) {
+      return 'critical';
+    } else if (detection.isApproaching) {
+      return 'approaching';
+    } else if (detection.distance && detection.distance < WARNING_DISTANCE) {
+      return 'warning';
+    }
+    return 'safe';
   };
 
   return (
@@ -294,6 +420,28 @@ function App() {
                 </TabsList>
 
                 <TabsContent value="camera" className="mode-content">
+                  {availableCameras.length > 1 && (
+                    <div className="camera-selector" data-testid="camera-selector">
+                      <label>Select Camera:</label>
+                      <Select value={selectedCamera} onValueChange={setSelectedCamera} disabled={cameraActive}>
+                        <SelectTrigger className="camera-select-trigger">
+                          <SelectValue placeholder="Choose camera" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {availableCameras.map((camera, idx) => (
+                            <SelectItem key={camera.deviceId} value={camera.deviceId}>
+                              {camera.label || `Camera ${idx + 1}`}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  )}
+                  
+                  <div className="camera-info" data-testid="camera-info">
+                    <p className="info-text">📹 {availableCameras.length} camera(s) detected</p>
+                  </div>
+                  
                   <div className="camera-controls">
                     {!cameraActive ? (
                       <Button onClick={startCamera} className="start-camera-btn" data-testid="start-camera-btn">
@@ -315,6 +463,11 @@ function App() {
                       className="camera-feed"
                       data-testid="camera-video"
                     />
+                    {cameraActive && (
+                      <div className="camera-overlay">
+                        <div className="fps-counter">Frame: {frameCountRef.current}</div>
+                      </div>
+                    )}
                     <canvas ref={canvasRef} style={{ display: 'none' }} />
                   </div>
                 </TabsContent>
@@ -388,19 +541,32 @@ function App() {
                 <div className="detections-table" data-testid="detections-table">
                   <div className="table-header">
                     <span>Object</span>
-                    <span>Confidence</span>
                     <span>Distance</span>
+                    <span>Status</span>
                   </div>
-                  {result.detections.map((detection, idx) => (
-                    <div key={idx} className={`table-row ${detection.alert ? 'alert-row' : ''}`} data-testid={`detection-row-${idx}`}>
-                      <span>{detection.class}</span>
-                      <span>{(detection.confidence * 100).toFixed(0)}%</span>
-                      <span className={detection.alert ? 'alert-distance' : ''}>
-                        {detection.distance ? `${detection.distance}m` : 'N/A'}
-                        {detection.alert && <AlertTriangle size={14} className="alert-icon" />}
-                      </span>
-                    </div>
-                  ))}
+                  {result.detections.map((detection, idx) => {
+                    const statusColor = getStatusColor(detection);
+                    return (
+                      <div key={idx} className={`table-row status-${statusColor}`} data-testid={`detection-row-${idx}`}>
+                        <span className="object-name">{detection.class}</span>
+                        <span className="distance-value">
+                          {detection.distance ? `${detection.distance}m` : 'N/A'}
+                        </span>
+                        <span className={`status-badge status-${statusColor}`}>
+                          {statusColor === 'critical' && (
+                            <><AlertTriangle size={14} /> CRITICAL</>
+                          )}
+                          {statusColor === 'approaching' && (
+                            <><TrendingDown size={14} /> APPROACHING</>
+                          )}
+                          {statusColor === 'warning' && (
+                            <><Bell size={14} /> NEARBY</>
+                          )}
+                          {statusColor === 'safe' && 'SAFE'}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               </CardContent>
             </Card>
@@ -415,6 +581,28 @@ function App() {
               </CardContent>
             </Card>
           )}
+
+          <Card className="legend-card">
+            <CardHeader>
+              <CardTitle>Alert Thresholds</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="legend-list">
+                <div className="legend-item critical">
+                  <AlertTriangle size={16} />
+                  <span>Critical: &lt;2m - Voice alert triggered</span>
+                </div>
+                <div className="legend-item approaching">
+                  <TrendingDown size={16} />
+                  <span>Approaching: Object moving closer</span>
+                </div>
+                <div className="legend-item warning">
+                  <Bell size={16} />
+                  <span>Nearby: Within 5m range</span>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
 
           {alerts.length > 0 && (
             <Card className="alerts-card">
