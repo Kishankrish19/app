@@ -136,6 +136,28 @@ h1, h2, h3 {
   margin-top: 1.5rem;
 }
 
+.source-selector {
+  margin-bottom: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.source-selector label {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #a5b4fc;
+}
+
+.source-select-trigger {
+  background: rgba(15, 23, 42, 0.8);
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  color: #e5e7eb;
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  font-weight: 500;
+}
+
 .camera-selector {
   margin-bottom: 1rem;
   display: flex;
